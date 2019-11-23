@@ -24,7 +24,7 @@ using namespace std;
 int SIZE = 4;
 queue<int> requests;
 int OFFSET = 0;
-int logfd;
+int logfd = 0;
 
 pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t conditionMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -225,11 +225,16 @@ void writeFileInput(char*f, int clientSocket, char buffer[]){
      * synchronization to actually write the log information, 
      * since no other thread is writing to that location. */
     
-    int startingPoint = OFFSET;
-    reserveSpaceToWriteLog(f, httpMethod, length, response);
-    pthread_mutex_unlock(&sharedVarMutex);
-    warn("get unlocked");
-    writeLog(buffer, length, f, httpMethod, startingPoint, response);
+    if(logfd != 0){
+        int startingPoint = OFFSET;
+        reserveSpaceToWriteLog(f, httpMethod, length, response);
+        pthread_mutex_unlock(&sharedVarMutex);
+        warn("get unlocked");
+        writeLog(buffer, length, f, httpMethod, startingPoint, response);
+    }
+    else{
+        pthread_mutex_unlock(&sharedVarMutex);
+    }
     
 }
 void parseHeader(char buffer[], char * httpMethod, char * filename, int * contentLength){
@@ -283,11 +288,17 @@ void PutRequest(char * filename, int clientSocket, int length){
      * synchronization to actually write the log information, 
      * since no other thread is writing to that location. */
     
-    int startingPoint = OFFSET;
-    reserveSpaceToWriteLog(filename, httpMethod, length, response);
-    pthread_mutex_unlock(&sharedVarMutex);
-    warn("put unlocked");
-    writeLog(buffer, length, filename, httpMethod, startingPoint, response);
+    if(logfd != 0){
+        int startingPoint = OFFSET;
+        reserveSpaceToWriteLog(filename, httpMethod, length, response);
+        pthread_mutex_unlock(&sharedVarMutex);
+        warn("put unlocked");
+        writeLog(buffer, length, filename, httpMethod, startingPoint, response);
+    }
+    else{
+        pthread_mutex_unlock(&sharedVarMutex);
+    }
+   
 
 }
 void reserveSpaceToWriteLog(char * filename, char * httpMethod, int length, int response){
