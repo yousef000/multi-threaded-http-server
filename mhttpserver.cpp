@@ -82,7 +82,6 @@ int main(int argc, char * argv[]){
     if(::listen(serverSocket, 5) < 0)
         warn("Listen");
 
-    int i = 0;
     while(true){
         clientSocket = ::accept(serverSocket, (struct sockaddr *) &address, (socklen_t *) &addrlen);
         if(clientSocket < 0){
@@ -94,13 +93,11 @@ int main(int argc, char * argv[]){
         pthread_mutex_lock(&queueMutex);
         //if threads are sleeping, wake them up
         if(requests.empty()){
-            i++;
             requests.push(clientSocket);
             pthread_cond_broadcast(&conditionCond);
         }
         //if threads are not sleeping, just push the clientSocket
         else{
-            i++;
             requests.push(clientSocket);
         }
         pthread_mutex_unlock(&queueMutex);
@@ -312,7 +309,7 @@ void reserveSpaceToWriteLog(char * filename, char * httpMethod, int length, int 
         } 
     }
     else{
-        OFFSET += 6 + strlen(httpMethod) + strlen(filename) + (strlen(to_string(response).c_str())) + 33;
+        OFFSET += 6 + strlen(httpMethod) + strlen(filename) + (strlen(to_string(response).c_str())) + 35;
     }
 }
 void writeLog(char * buffer, int length, char * filename, char * httpMethod, int offset, int response){
@@ -353,7 +350,7 @@ void writeLog(char * buffer, int length, char * filename, char * httpMethod, int
         offset += 9;
     }
     else{
-        sprintf(header, "FAIL: %s %s HTTP/1.1 --- response %d\n=======\n", httpMethod, filename, response);
+        sprintf(header, "FAIL: %s %s HTTP/1.1 --- response %d\\n\n=======\n", httpMethod, filename, response);
         pwrite(logfd, header, strlen(header), offset);
         offset += strlen(header);
     }
@@ -365,9 +362,9 @@ void *processRequests(void *){
     char filename[27];
     int contentLength = 0;
     int clientSocket;
+    char buffer[BUFFSIZE];
 
     while(true){
-        char buffer[BUFFSIZE];
         clientSocket = -1;
         pthread_mutex_lock(&conditionMutex);
         if(requests.empty()){
