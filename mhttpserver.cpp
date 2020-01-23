@@ -1,5 +1,6 @@
 #include <iostream>
 #include <queue>
+#include <list>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,17 +19,31 @@
 #include <arpa/inet.h>
 #include <iomanip>
 #include <ctime>
+#include <vector>
 
 using namespace std;
 #define BUFFSIZE 16 * 1024
-int SIZE = 4;
+
+struct cacheItem{
+    char * filename;
+    char * content;
+    int length;
+};
+list<cacheItem> cache;
 queue<int> requests;
+list<char*> filenames;
+
+int SIZE = 1;
 int OFFSET = 0;
 int logfd = 0;
+bool caching = false;
+
+
 
 pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t conditionMutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t sharedVarMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t cacheMutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t conditionCond = PTHREAD_COND_INITIALIZER;
 
 int isDirectory(const char *path);
@@ -45,16 +60,18 @@ bool checkWritePermission(char*filename);
 void writeFileInput(char*f, int clientSocket, char buffer[]);
 void parseHeader(char buffer[], char * httpMethod, char * filename, int * contentLength);
 void GetRequest(char * filename, int clientSocket);
-void PutRequest(char * filename, int clientSocket, int length);
+void PutRequest(char * filename, int clientSocket, int length, char * content, bool wasInCache);
+void GetCache(char * filename, int clientsocket);
+void PutCache(char * filename, int clientsocket, int length);
 void *processRequests(void* arguments);
 void initWorkers(pthread_t * workers, int size);
-void reserveSpaceToWriteLog(char * filename, char * httpMethod, int length, int response);
-void writeLog(char * buffer, int length, char * filename, char * httpMethod, int offset, int response);
+void reserveSpaceToWriteLog(char * filename, char * httpMethod, int length, int response, bool inCache);
+void writeLog(char * buffer, int length, char * filename, char * httpMethod, int offset, int response, bool inCache);
 void parseArguments(int argc, char * argv[]);
+bool isInCache(char * filename);
 
 int main(int argc, char * argv[]){
     //int start = clock();
-
     int serverSocket, clientSocket;
     parseArguments(argc, argv);
     pthread_t workers[SIZE];
@@ -88,8 +105,6 @@ int main(int argc, char * argv[]){
             warn("Accept");
             break;
         }
-            
-        
         pthread_mutex_lock(&queueMutex);
         //if threads are sleeping, wake them up
         if(requests.empty()){
@@ -168,15 +183,18 @@ bool checkWritePermission(char*filename){
 }
 void parseArguments(int argc, char * argv[]){
     int c;
-    while((c = getopt(argc, argv, "N:I:")) != -1){
+    while((c = getopt(argc, argv, "N:l:c")) != -1){
         switch(c){
             case('N'):
                 SIZE = atoi(optarg);
                 break;
-            case('I'):
+            case('l'):
                 if((logfd = open(optarg, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0){
                     warn("%s", optarg);
                 }
+                break;
+            case('c'):
+                caching = true;
                 break;
             case('?'):  
                 break; 
@@ -224,10 +242,10 @@ void writeFileInput(char*f, int clientSocket, char buffer[]){
     
     if(logfd != 0){
         int startingPoint = OFFSET;
-        reserveSpaceToWriteLog(f, httpMethod, length, response);
+        reserveSpaceToWriteLog(f, httpMethod, length, response, false);
         pthread_mutex_unlock(&sharedVarMutex);
         warn("get unlocked");
-        writeLog(buffer, length, f, httpMethod, startingPoint, response);
+        writeLog(buffer, length, f, httpMethod, startingPoint, response, false);
     }
     else{
         pthread_mutex_unlock(&sharedVarMutex);
@@ -244,7 +262,7 @@ void GetRequest(char * filename, int clientSocket){
     char buffer[BUFFSIZE];
     writeFileInput(filename, clientSocket, buffer);
 }
-void PutRequest(char * filename, int clientSocket, int length){
+void PutRequest(char * filename, int clientSocket, int length, char * content, bool wasInCache){
     warn("Put req started");
     pthread_mutex_lock(&sharedVarMutex);
     warn("put locked");
@@ -262,15 +280,22 @@ void PutRequest(char * filename, int clientSocket, int length){
             response = 403;
         }
     }
+    warn("opening file");
     if((fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0){
         warn("%s", filename);
     }
-    char inputToWrite[BUFFSIZE];
-    if((length = read(clientSocket, buffer, BUFFSIZE)) >= 0){
-        sscanf(buffer, "%[^/1.1]", inputToWrite);
-        write(fd, inputToWrite, length);
-        
+    warn("file opened");
+    if(wasInCache == true)
+        write(fd, content, length);
+    else{
+        char inputToWrite[BUFFSIZE];
+        if((length = read(clientSocket, buffer, BUFFSIZE)) >= 0){
+            sscanf(buffer, "%[^/1.1]", inputToWrite);
+            write(fd, inputToWrite, length);
+            
+        }
     }
+    warn("buffer %s", buffer);
     if(file_exist)
         response200(clientSocket);
     else if(response != 403){
@@ -279,49 +304,96 @@ void PutRequest(char * filename, int clientSocket, int length){
     responseContentLength(clientSocket, 0);
     close(fd);
     warn("Put req finished");
-
+    
     /* The program will need to use synchronization between 
      * threads to reserve the space, but should need no 
      * synchronization to actually write the log information, 
      * since no other thread is writing to that location. */
     
-    if(logfd != 0){
+    if(caching == false){
+        if(logfd != 0){
         int startingPoint = OFFSET;
-        reserveSpaceToWriteLog(filename, httpMethod, length, response);
+        reserveSpaceToWriteLog(filename, httpMethod, length, response, false);
         pthread_mutex_unlock(&sharedVarMutex);
         warn("put unlocked");
-        writeLog(buffer, length, filename, httpMethod, startingPoint, response);
+        writeLog(buffer, length, filename, httpMethod, startingPoint, response, false);
+        }
+        else{
+            pthread_mutex_unlock(&sharedVarMutex);
+        }
     }
     else{
         pthread_mutex_unlock(&sharedVarMutex);
     }
+    
+
    
 
 }
-void reserveSpaceToWriteLog(char * filename, char * httpMethod, int length, int response){
+void reserveSpaceToWriteLog(char * filename, char * httpMethod, int length, int response, bool inCache){
     if(response == 200){
-        if(length == 0)
-            OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + 8;
-        else if((length%20) == 0 && length >= 20)
-            OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + length*2 + 9*(length/20) + 11 + 19*(length/20);
+        int cacheReserve = 15;
+        if(inCache == false){
+            if(caching == true)
+                cacheReserve = 19;
+            else{
+                cacheReserve = 0;
+            }
+            if(length == 0)
+                OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + 8 + cacheReserve;
+            else if((length%20) == 0 && length >= 20)
+                OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + length*2 + 9*(length/20) + 11 + 19*(length/20) + cacheReserve;
+            else{
+                OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + length*2 + 9*(length/20)+9 + 13 + 19*(length/20) + (length%20) + cacheReserve;
+            } 
+        }
         else{
-            OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + length*2 + 9*(length/20)+9 + 13 + 19*(length/20) + (length%20);
-        } 
+            if(length == 0)
+                OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + 8 + cacheReserve;
+            else if((length%20) == 0 && length >= 20)
+                OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + length*2 + 9*(length/20) + 11 + 19*(length/20) + cacheReserve;
+            else{
+                OFFSET += strlen(httpMethod) + strlen(filename) + 10 + (strlen(to_string(length).c_str())) + length*2 + 9*(length/20)+9 + 13 + 19*(length/20) + (length%20) + cacheReserve;
+            } 
+
+        }
+        
     }
     else{
         OFFSET += 6 + strlen(httpMethod) + strlen(filename) + (strlen(to_string(response).c_str())) + 35;
     }
 }
-void writeLog(char * buffer, int length, char * filename, char * httpMethod, int offset, int response){
+void writeLog(char * buffer, int length, char * filename, char * httpMethod, int offset, int response, bool inCache){
     warn("Offset before writing %d", offset);
     warn("response %d\n", response);
     char header[BUFFSIZE];
     if(response == 200){
-        if(length == 0)
-            sprintf(header, "%s %s length %d", httpMethod, filename, length);
-        else{
-            sprintf(header, "%s %s length %d\n00000000 ", httpMethod, filename, length);
+        if(caching == false){
+            if(length == 0)
+                sprintf(header, "%s %s length %d", httpMethod, filename, length);
+            else{
+                sprintf(header, "%s %s length %d\n00000000 ", httpMethod, filename, length);
+            }
         }
+        else{
+            if(inCache == false){
+                if(length == 0)
+                    sprintf(header, "%s %s length %d [was not in cache]", httpMethod, filename, length);
+                else{
+                    sprintf(header, "%s %s length %d [was not in cache]\n00000000 ", httpMethod, filename, length);
+                }
+
+            }
+            else{
+                if(length == 0)
+                    sprintf(header, "%s %s length %d [was in cache]", httpMethod, filename, length);
+                else{
+                    sprintf(header, "%s %s length %d [was in cache]\n00000000 ", httpMethod, filename, length);
+                }
+            }
+
+        }
+        
         pwrite(logfd, header, strlen(header), offset);
         offset += strlen(header);
         char paddedBytes[BUFFSIZE];
@@ -378,24 +450,40 @@ void *processRequests(void *){
 
         if(clientSocket >= 0){
             warn("clientsocket recv");
-        
+            warn("before parsing %s", cache.back().filename);
             length = read(clientSocket, buffer, BUFFSIZE);
+            filenames.push_back(cache.back().filename);
             parseHeader(buffer, httpMethod, filename, &contentLength);
-            warn("buffer changed");
+            cache.back().filename = filenames.back();
+            warn("after parsing %s", cache.back().filename);
+
             if((filename[0] == '/' && strlen(filename) != 28) || (filename[0] != '/' && strlen(filename) != 27)){
                 response400(clientSocket);
                 responseContentLength(clientSocket, 0);
                 pthread_mutex_lock(&sharedVarMutex);
                 int startingPoint = OFFSET;
-                reserveSpaceToWriteLog(filename, httpMethod, length, 400);
+                reserveSpaceToWriteLog(filename, httpMethod, length, 400, false);
                 pthread_mutex_unlock(&sharedVarMutex);
                 warn("put unlocked");
-                writeLog(buffer, length, filename, httpMethod, startingPoint, 400);
+                writeLog(buffer, length, filename, httpMethod, startingPoint, 400, false);
             }
-            else if(strcmp(httpMethod, "GET") == 0)
-                GetRequest(filename, clientSocket);
-            else if(strcmp(httpMethod, "PUT") == 0)
-                PutRequest(filename, clientSocket, length);
+            /** if get request then check if it's in cache then read from cache
+                else read from the disk */
+            else if(strcmp(httpMethod, "GET") == 0){
+                if(isInCache(filename) == true && caching == true)
+                    GetCache(filename, clientSocket);
+                else{
+                    GetRequest(filename, clientSocket);
+                }   
+            }
+            /** if put request then save it in cache */
+            else if(strcmp(httpMethod, "PUT") == 0){
+                if(caching == true)
+                    PutCache(filename, clientSocket, length);
+                else{
+                    PutRequest(filename, clientSocket, length, buffer, false);
+                }
+            }
             else{
                 response500(clientSocket);
             }
@@ -403,8 +491,6 @@ void *processRequests(void *){
             close(clientSocket);
 
         }
-        
-
 
     }
 
@@ -416,3 +502,100 @@ void initWorkers(pthread_t * workers, int size){
             warn("Thread");
     }
 }
+void PutCache(char * filename, int clientSocket, int length){
+    if(filename[0] == '/')
+        filename++;
+    char buffer[BUFFSIZE];
+    char inputToWrite[BUFFSIZE];
+    char httpMethod[4] = "PUT";
+    int response = 200;
+    bool inCache = false;
+    list<cacheItem> :: iterator it;
+
+    cacheItem item;
+    item.filename = filename;
+
+    /** Read file content */
+    if((length = read(clientSocket, buffer, BUFFSIZE)) >= 0){
+        sscanf(buffer, "%[^/1.1]", inputToWrite);
+        item.content = inputToWrite;
+        item.length = length;
+    }
+
+    /* if file is in cache then modify */
+
+    for(it = cache.begin(); it != cache.end(); ++it){
+        warn("size: %lu", cache.size());
+        warn("filename %s, itfilename %s", filename, (*it).filename);
+        if(filename == (*it).filename){
+            (*it).content = item.content;
+            (*it).length = item.length;
+            inCache = true;
+            warn("%s %s %d", (*it).filename, (*it).content, (*it).length);
+            warn("cache size: %lu", cache.size());
+        }
+    }
+
+
+    
+    /** if file is not in cache, remove the first item of cache
+        and add the new item to the end */
+    if(inCache == false){
+        /** if cache is full then write the removed file content to disk */
+        if(cache.size() >= 4){
+            cacheItem removedItem = cache.front();
+            cache.push_back(item);
+            cache.pop_front();
+            warn("%s", removedItem.filename);
+            PutRequest(removedItem.filename, clientSocket, removedItem.length, removedItem.content, true);
+        }
+        else{
+            cache.push_back(item);
+        }
+        warn("cache 0 %s", cache.back().filename);
+        
+    }
+    if(logfd != 0){
+        int startingPoint = OFFSET;
+        reserveSpaceToWriteLog(filename, httpMethod, length, response, inCache);
+        warn("put cache unlocked");
+        writeLog(buffer, length, filename, httpMethod, startingPoint, response, inCache);
+    }
+    response200(clientSocket);
+    responseContentLength(clientSocket, length);
+}
+bool isInCache(char * filename){
+    if(filename[0] == '/')
+        filename++;
+    warn("isincache: %s", filename);
+    list<cacheItem> :: iterator it;
+    for(it = cache.begin(); it != cache.end(); ++it){
+        warn("isincache: %s", (*it).filename);
+        if(filename == (*it).filename){
+            return true;
+        }
+    }
+    return false;
+}
+void GetCache(char * filename, int clientSocket){
+    if(filename[0] == '/')
+        filename++;
+    char httpMethod[4] = "GET";
+    int response = 200;
+    list <cacheItem> :: iterator it;
+    for(it = cache.begin(); it != cache.end(); ++it){
+        if(filename == (*it).filename){
+            response200(clientSocket);
+            responseContentLength(clientSocket, (*it).length);
+            send(clientSocket, (*it).content, (*it).length, 0);
+            warn("was in the cache");
+            if(logfd != 0){
+                int startingPoint = OFFSET;
+                reserveSpaceToWriteLog((*it).filename, httpMethod, (*it).length, response, true);
+                warn("get cache unlocked");
+                writeLog((*it).content, (*it).length, (*it).filename, httpMethod, startingPoint, response, true);
+            }
+        }
+    }
+}
+
